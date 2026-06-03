@@ -1,3 +1,7 @@
-# Required only for the default "vad" (voice activity) detector.
+# Default "silero" detector (speech-only, rejects music/noise):
+onnxruntime>=1.16
+numpy>=1.21
+
+# Optional: only needed for the lighter "--detector vad" (WebRTC) backend.
 # The "silence" detector needs no Python packages, just ffmpeg.
 webrtcvad-wheels>=2.0.10

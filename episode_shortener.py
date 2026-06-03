@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Episode shortener.
 
-Detect speech in a video and cut out the long filler scenes where nobody is
-talking. Around every detected speech region we keep a configurable buffer of
-``x`` seconds before the speech and ``y`` seconds after it; everything outside
-those padded speech regions is dropped. The result is a tighter cut that keeps
-the dialogue (plus a little breathing room) and removes the dead air that makes
-Turkish series drag on.
+Detect *speech* in a video and cut out everything else — music, ambience and
+the long filler scenes where nobody is talking. Around every detected speech
+region we keep a configurable buffer of ``x`` seconds before the speech and
+``y`` seconds after it; everything outside those padded speech regions is
+dropped. The result is a tighter cut that keeps only the dialogue (plus a
+little breathing room) and removes the dead air that makes Turkish series drag
+on.
 
 Usage:
     python3 episode_shortener.py input.mkv -o output.mp4 -x 0.5 -y 1.0
 
-Requires ``ffmpeg``/``ffprobe`` on PATH. The default ``vad`` detector also needs
-the ``webrtcvad`` (or ``webrtcvad-wheels``) Python package.
+Requires ``ffmpeg``/``ffprobe`` on PATH. The default ``silero`` detector also
+needs the ``onnxruntime`` and ``numpy`` Python packages plus the bundled
+``silero_vad.onnx`` model file.
 """
 
 import argparse
@@ -22,6 +24,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
+
+# Default location of the bundled Silero VAD model (sits next to this script).
+DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "silero_vad.onnx")
+SILERO_MODEL_URL = ("https://github.com/snakers4/silero-vad/raw/master/"
+                    "src/silero_vad/data/silero_vad.onnx")
 
 
 # --------------------------------------------------------------------------- #
@@ -68,11 +77,84 @@ def get_duration(path):
 # --------------------------------------------------------------------------- #
 # Speech detection backends
 # --------------------------------------------------------------------------- #
+def _ensure_silero_model(model_path):
+    """Return a usable model path, downloading the bundled model if missing."""
+    if os.path.isfile(model_path):
+        return model_path
+    print(f"Silero model not found at '{model_path}', downloading...")
+    try:
+        urllib.request.urlretrieve(SILERO_MODEL_URL, model_path)
+    except Exception as exc:  # network/permission issues
+        sys.exit(
+            f"error: could not download the Silero VAD model: {exc}\n"
+            f"       Download it manually from {SILERO_MODEL_URL}\n"
+            f"       and save it to {model_path}, or pass --model <path>."
+        )
+    return model_path
+
+
+def detect_speech_silero(path, threshold, min_silence, min_speech, model_path):
+    """Detect speech with the Silero VAD neural model (the default).
+
+    Silero is trained specifically to find *human voice*, so it reliably
+    rejects music, sound effects and ambience instead of treating any loud
+    audio as speech. Returns a list of (start, end) speech intervals.
+    """
+    try:
+        import numpy as np
+        import onnxruntime as ort
+    except ImportError:
+        sys.exit(
+            "error: the 'silero' detector needs numpy and onnxruntime.\n"
+            "       Install them with:  pip install -r requirements.txt\n"
+            "       or pick another detector with:  --detector vad|silence"
+        )
+
+    model_path = _ensure_silero_model(model_path)
+    sample_rate = 16000
+    window = 512          # required window size for 16 kHz in Silero v5
+    context_size = 64     # samples of previous audio prepended to each window
+
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", path,
+            "-vn", "-ac", "1", "-ar", str(sample_rate),
+            "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1",
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"error: ffmpeg failed to extract audio:\n{proc.stderr.decode(errors='replace').strip()}")
+
+    audio = np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
+    session = ort.InferenceSession(model_path,
+                                   providers=["CPUExecutionProvider"])
+    state = np.zeros((2, 1, 128), dtype=np.float32)
+    context = np.zeros((1, context_size), dtype=np.float32)
+    sr_arg = np.array(sample_rate, dtype=np.int64)
+
+    # Run the model over consecutive windows, carrying state + context forward.
+    flags = []
+    for offset in range(0, len(audio) - window + 1, window):
+        chunk = audio[offset:offset + window][None, :]
+        model_input = np.concatenate([context, chunk], axis=1)
+        prob, state = session.run(
+            None, {"input": model_input, "state": state, "sr": sr_arg}
+        )
+        context = chunk[:, -context_size:]
+        flags.append(float(prob[0, 0]) >= threshold)
+
+    frame_dur = window / sample_rate
+    return _frames_to_segments(flags, frame_dur, min_silence, min_speech)
+
+
 def detect_speech_vad(path, aggressiveness, frame_ms, min_silence, min_speech):
     """Detect speech with WebRTC voice-activity detection.
 
-    Better than plain volume thresholding for content with background music,
-    because it looks for voice specifically rather than just "loud audio".
+    A lightweight alternative to the Silero detector. Better than plain volume
+    thresholding, but weaker at rejecting music — it can mistake music for
+    voice. Prefer ``--detector silero`` when you want speech only.
     Returns a list of (start, end) speech intervals in seconds.
     """
     try:
@@ -252,8 +334,8 @@ def cut_and_concat(input_path, output_path, segments, video_codec, audio_codec, 
 # --------------------------------------------------------------------------- #
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Shorten a video by keeping speech (plus a buffer) and "
-                    "removing silent filler scenes.",
+        description="Shorten a video by keeping only speech (plus a buffer) and "
+                    "removing music, ambience and silent filler scenes.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("input", help="path to the input video file")
@@ -268,22 +350,33 @@ def parse_args(argv=None):
                    help="seconds of video to KEEP after each speech region "
                         "(everything else after it is cut)")
 
-    p.add_argument("--detector", choices=["vad", "silence"], default="vad",
-                   help="speech detector: 'vad' finds human voice (best for "
-                        "content with background music), 'silence' keeps any "
-                        "non-quiet audio")
+    p.add_argument("--detector", choices=["silero", "vad", "silence"],
+                   default="silero",
+                   help="speech detector: 'silero' is a neural model that keeps "
+                        "speech ONLY and rejects music/noise (recommended); "
+                        "'vad' is a lighter WebRTC voice detector; 'silence' "
+                        "keeps any non-quiet audio (music included)")
 
-    # VAD detector options.
+    # Silero detector options.
+    p.add_argument("--threshold", type=float, default=0.5,
+                   help="[silero] speech probability cutoff, 0..1 "
+                        "(raise toward 1 to be stricter and drop more music)")
+    p.add_argument("--model", default=DEFAULT_MODEL_PATH,
+                   help="[silero] path to the silero_vad.onnx model file")
+
+    # WebRTC VAD detector options.
     p.add_argument("--aggressiveness", type=int, choices=[0, 1, 2, 3], default=2,
                    help="[vad] 0=lenient .. 3=aggressive at rejecting non-speech")
     p.add_argument("--frame-ms", type=int, choices=[10, 20, 30], default=30,
                    help="[vad] analysis frame size in milliseconds")
-    p.add_argument("--min-speech", type=float, default=0.2,
-                   help="[vad] ignore detected speech shorter than this (s)")
 
     # Silence detector options.
     p.add_argument("--noise-db", type=float, default=-30.0,
                    help="[silence] audio below this level (dB) counts as silence")
+
+    # Shared by silero/vad.
+    p.add_argument("--min-speech", type=float, default=0.2,
+                   help="[silero/vad] ignore detected speech shorter than this (s)")
 
     # Shared.
     p.add_argument("--min-silence", type=float, default=0.5,
@@ -318,7 +411,12 @@ def main(argv=None):
     original = get_duration(args.input)
 
     print(f"Analyzing '{args.input}' with the '{args.detector}' detector...")
-    if args.detector == "vad":
+    if args.detector == "silero":
+        speech = detect_speech_silero(
+            args.input, args.threshold, args.min_silence,
+            args.min_speech, args.model,
+        )
+    elif args.detector == "vad":
         speech = detect_speech_vad(
             args.input, args.aggressiveness, args.frame_ms,
             args.min_silence, args.min_speech,
@@ -329,9 +427,9 @@ def main(argv=None):
         )
 
     if not speech:
-        sys.exit("No speech detected — nothing to keep. Try a different detector "
-                 "or relax the thresholds (e.g. lower --aggressiveness or "
-                 "--noise-db).")
+        sys.exit("No speech detected — nothing to keep. Try lowering "
+                 "--threshold (silero) or relaxing the other detector "
+                 "thresholds, or switch --detector.")
 
     keep = pad_and_merge(speech, args.pad_before, args.pad_after, original)
     shortened = total_length(keep)
