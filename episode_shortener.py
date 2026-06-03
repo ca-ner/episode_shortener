@@ -259,10 +259,14 @@ def parse_args(argv=None):
     p.add_argument("input", help="path to the input video file")
     p.add_argument("-o", "--output", help="path to the output video "
                    "(default: <input>_short.mp4)")
-    p.add_argument("-x", "--pad-before", type=float, default=0.5,
-                   help="seconds of video to KEEP before each speech region")
-    p.add_argument("-y", "--pad-after", type=float, default=1.0,
-                   help="seconds of video to KEEP after each speech region")
+    p.add_argument("-x", "--pad-before", "-before", "--before",
+                   dest="pad_before", type=float, default=0.5,
+                   help="seconds of video to KEEP before each speech region "
+                        "(everything else before it is cut)")
+    p.add_argument("-y", "--pad-after", "-after", "--after",
+                   dest="pad_after", type=float, default=1.0,
+                   help="seconds of video to KEEP after each speech region "
+                        "(everything else after it is cut)")
 
     p.add_argument("--detector", choices=["vad", "silence"], default="vad",
                    help="speech detector: 'vad' finds human voice (best for "

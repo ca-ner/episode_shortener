@@ -32,6 +32,9 @@ time.
 # Default: voice-activity detection, keep 0.5s before / 1.0s after each line
 python3 episode_shortener.py episode.mkv -o episode_short.mp4
 
+# Keep 3s before and 3s after each speech, cut everything else
+python3 episode_shortener.py episode.mkv -o episode_short.mp4 -before 3 -after 3
+
 # Tighter cut: keep less padding
 python3 episode_shortener.py episode.mkv -x 0.3 -y 0.5
 
@@ -43,8 +46,8 @@ python3 episode_shortener.py episode.mkv --dry-run
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `-x`, `--pad-before` | `0.5` | Seconds of video to keep **before** each speech region |
-| `-y`, `--pad-after` | `1.0` | Seconds of video to keep **after** each speech region |
+| `-x`, `-before`, `--pad-before` | `0.5` | Seconds of video to keep **before** each speech region |
+| `-y`, `-after`, `--pad-after` | `1.0` | Seconds of video to keep **after** each speech region |
 | `--detector` | `vad` | `vad` (detects human voice) or `silence` (keeps any non-quiet audio) |
 | `--min-silence` | `0.5` | Gaps shorter than this aren't treated as filler |
 | `--dry-run` | off | Detect & report only; don't write a file |
