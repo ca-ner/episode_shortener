@@ -12,12 +12,18 @@ on.
 Usage:
     python3 episode_shortener.py input.mkv -o output.mp4 -x 0.5 -y 1.0
 
+The input may also be a *folder*, in which case every video inside it is
+processed into a ``<name>_processed.mp4`` sibling (folder mode). Pass
+``-log <file>`` to append a detailed report (filenames, codecs, lengths, kept
+and removed time-ranges) for every processed file.
+
 Requires ``ffmpeg``/``ffprobe`` on PATH. The default ``silero`` detector also
 needs the ``onnxruntime`` and ``numpy`` Python packages plus the bundled
 ``silero_vad.onnx`` model file.
 """
 
 import argparse
+import datetime
 import json
 import os
 import shutil
@@ -25,6 +31,12 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+
+# Video file extensions recognised in folder mode.
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".ts", ".webm", ".flv",
+    ".wmv", ".mpg", ".mpeg", ".m4v", ".3gp", ".m2ts", ".mts",
+}
 
 # Default location of the bundled Silero VAD model (sits next to this script).
 DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -351,9 +363,13 @@ def parse_args(argv=None):
                     "removing music, ambience and silent filler scenes.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("input", help="path to the input video file")
-    p.add_argument("-o", "--output", help="path to the output video "
-                   "(default: <input>_short.mp4)")
+    p.add_argument("input",
+                   help="path to a video file, OR a folder to process every "
+                        "video inside it (folder mode)")
+    p.add_argument("-o", "--output",
+                   help="path to the output video (single-file mode only; "
+                        "default: <input>_short.mp4). Ignored in folder mode, "
+                        "where outputs are named <name>_processed.mp4")
     p.add_argument("-x", "--pad-before", "-before", "--before",
                    dest="pad_before", type=float, default=0.5,
                    help="seconds of video to KEEP before each speech region "
@@ -403,7 +419,182 @@ def parse_args(argv=None):
 
     p.add_argument("--dry-run", action="store_true",
                    help="only detect and report; do not write an output file")
+    p.add_argument("-log", "--log", dest="log",
+                   help="append a detailed report for every processed file to "
+                        "this log file (filenames, codecs, lengths, kept and "
+                        "removed time-ranges) — handy for folder mode")
     return p.parse_args(argv)
+
+
+def run_detector(args, input_path, original):
+    """Dispatch to the configured detector and return speech intervals."""
+    if args.detector == "silero":
+        return detect_speech_silero(
+            input_path, args.threshold, args.min_silence,
+            args.min_speech, args.model,
+        )
+    if args.detector == "vad":
+        return detect_speech_vad(
+            input_path, args.aggressiveness, args.frame_ms,
+            args.min_silence, args.min_speech,
+        )
+    return detect_speech_silence(
+        input_path, args.noise_db, args.min_silence, original,
+    )
+
+
+def _print_ranges(title, ranges):
+    print(f"{title} (start -> end, duration):")
+    if not ranges:
+        print("  (none)")
+    for i, (s, e) in enumerate(ranges, 1):
+        print(f"  {i:3d}. {format_duration(s)} -> {format_duration(e)}  "
+              f"({format_duration(e - s)})")
+
+
+def process_one(args, input_path, output_path):
+    """Detect speech in one file, optionally cut it, and return a result dict.
+
+    The returned dict captures everything needed for the summary and the log.
+    Never raises on "no speech" — it returns a result with status set so batch
+    (folder) runs can keep going.
+    """
+    original = get_duration(input_path)
+    result = {
+        "input": input_path,
+        "output": output_path,
+        "detector": args.detector,
+        "video_codec": args.video_codec,
+        "audio_codec": args.audio_codec,
+        "crf": args.crf,
+        "original": original,
+        "dry_run": args.dry_run,
+        "status": "ok",
+        "keep": [],
+        "removed": [],
+        "shortened": 0.0,
+    }
+
+    print(f"\nAnalyzing '{input_path}' with the '{args.detector}' detector...")
+    speech = run_detector(args, input_path, original)
+
+    if not speech:
+        result["status"] = "no-speech"
+        result["removed"] = [(0.0, original)]
+        print("  No speech detected — nothing to keep (file skipped).")
+        print("  Try lowering --threshold (silero) or switching --detector.")
+        return result
+
+    keep = pad_and_merge(speech, args.pad_before, args.pad_after, original)
+    removed_ranges = complement(keep, original)
+    shortened = total_length(keep)
+    result["keep"] = keep
+    result["removed"] = removed_ranges
+    result["shortened"] = shortened
+
+    print(f"Detected {len(speech)} speech region(s); "
+          f"keeping {len(keep)} segment(s) after padding/merging.\n")
+    _print_ranges("Kept time-ranges", keep)
+    print()
+    _print_ranges("Removed time-ranges", removed_ranges)
+    print()
+
+    if not args.dry_run:
+        print("Cutting and re-encoding... (this can take a while)")
+        cut_and_concat(input_path, output_path, keep,
+                       args.video_codec, args.audio_codec, args.crf)
+        shortened = get_duration(output_path)  # report the real result
+        result["shortened"] = shortened
+
+    removed = original - shortened
+    percent = (removed / original * 100) if original else 0.0
+
+    print("\n" + "=" * 44)
+    print(f"  Original length:  {format_duration(original)}")
+    print(f"  Shortened length: {format_duration(shortened)}")
+    print(f"  Removed:          {format_duration(removed)} ({percent:.1f}%)")
+    print("=" * 44)
+    if not args.dry_run:
+        print(f"  Saved to: {output_path}")
+    return result
+
+
+def write_log_entry(log_path, result):
+    """Append a detailed, human-readable report for one file to the log."""
+    original = result["original"]
+    shortened = result["shortened"]
+    removed = original - shortened
+    percent = (removed / original * 100) if original else 0.0
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"[{stamp}] {os.path.basename(result['input'])}")
+    lines.append(f"  Original file:    {os.path.abspath(result['input'])}")
+    if result["status"] == "no-speech":
+        lines.append("  Output file:      (none — no speech detected, skipped)")
+    elif result["dry_run"]:
+        lines.append(f"  Output file:      {os.path.abspath(result['output'])} "
+                     f"(dry-run, not written)")
+    else:
+        lines.append(f"  Output file:      {os.path.abspath(result['output'])}")
+    lines.append(f"  Detector:         {result['detector']}")
+    lines.append(f"  Video codec:      {result['video_codec']} (crf {result['crf']})")
+    lines.append(f"  Audio codec:      {result['audio_codec']}")
+    lines.append(f"  Original length:  {format_duration(original)}")
+    lines.append(f"  Shortened length: {format_duration(shortened)}")
+    lines.append(f"  Removed:          {format_duration(removed)} ({percent:.1f}%)")
+
+    lines.append(f"  Kept time-ranges ({len(result['keep'])}):")
+    for i, (s, e) in enumerate(result["keep"], 1):
+        lines.append(f"     {i:3d}. {format_duration(s)} -> {format_duration(e)}  "
+                     f"({format_duration(e - s)})")
+    lines.append(f"  Removed time-ranges ({len(result['removed'])}):")
+    for i, (s, e) in enumerate(result["removed"], 1):
+        lines.append(f"     {i:3d}. {format_duration(s)} -> {format_duration(e)}  "
+                     f"({format_duration(e - s)})")
+    lines.append("")
+
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def find_videos(folder):
+    """Return sorted video files in a folder, skipping our own outputs."""
+    videos = []
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in VIDEO_EXTENSIONS:
+            continue
+        if stem.endswith("_processed") or stem.endswith("_short"):
+            continue  # don't re-process files we (likely) produced
+        videos.append(path)
+    return videos
+
+
+def build_jobs(args):
+    """Return a list of (input_path, output_path) pairs to process."""
+    if os.path.isdir(args.input):
+        videos = find_videos(args.input)
+        if not videos:
+            sys.exit(f"error: no video files found in folder: {args.input}")
+        jobs = []
+        for path in videos:
+            stem, _ = os.path.splitext(path)
+            jobs.append((path, f"{stem}_processed.mp4"))
+        return jobs, True
+
+    if os.path.isfile(args.input):
+        output = args.output
+        if not output:
+            base, _ = os.path.splitext(args.input)
+            output = f"{base}_short.mp4"
+        return [(args.input, output)], False
+
+    sys.exit(f"error: input not found: {args.input}")
 
 
 def main(argv=None):
@@ -411,80 +602,41 @@ def main(argv=None):
 
     require_tool("ffmpeg")
     require_tool("ffprobe")
-    if not os.path.isfile(args.input):
-        sys.exit(f"error: input file not found: {args.input}")
     if args.pad_before < 0 or args.pad_after < 0:
         sys.exit("error: --pad-before and --pad-after must be >= 0.")
 
-    output = args.output
-    if not output:
-        base, _ = os.path.splitext(args.input)
-        output = f"{base}_short.mp4"
+    jobs, folder_mode = build_jobs(args)
+    if folder_mode:
+        print(f"Folder mode: {len(jobs)} video(s) to process in '{args.input}'.")
 
-    original = get_duration(args.input)
+    results = []
+    for index, (input_path, output_path) in enumerate(jobs, 1):
+        if folder_mode:
+            print(f"\n##### [{index}/{len(jobs)}] {os.path.basename(input_path)} #####")
+        try:
+            result = process_one(args, input_path, output_path)
+        except SystemExit:
+            raise
+        except Exception as exc:  # keep a batch going if one file fails
+            print(f"  ERROR processing '{input_path}': {exc}")
+            if not folder_mode:
+                raise
+            result = {
+                "input": input_path, "output": output_path,
+                "detector": args.detector, "video_codec": args.video_codec,
+                "audio_codec": args.audio_codec, "crf": args.crf,
+                "original": 0.0, "shortened": 0.0, "dry_run": args.dry_run,
+                "status": "error", "keep": [], "removed": [],
+            }
+        results.append(result)
+        if args.log:
+            write_log_entry(args.log, result)
 
-    print(f"Analyzing '{args.input}' with the '{args.detector}' detector...")
-    if args.detector == "silero":
-        speech = detect_speech_silero(
-            args.input, args.threshold, args.min_silence,
-            args.min_speech, args.model,
-        )
-    elif args.detector == "vad":
-        speech = detect_speech_vad(
-            args.input, args.aggressiveness, args.frame_ms,
-            args.min_silence, args.min_speech,
-        )
-    else:
-        speech = detect_speech_silence(
-            args.input, args.noise_db, args.min_silence, original,
-        )
-
-    if not speech:
-        sys.exit("No speech detected — nothing to keep. Try lowering "
-                 "--threshold (silero) or relaxing the other detector "
-                 "thresholds, or switch --detector.")
-
-    keep = pad_and_merge(speech, args.pad_before, args.pad_after, original)
-    shortened = total_length(keep)
-    removed = original - shortened
-    percent = (removed / original * 100) if original else 0.0
-
-    print(f"Detected {len(speech)} speech region(s); "
-          f"keeping {len(keep)} segment(s) after padding/merging.\n")
-
-    if args.dry_run:
-        # Show exactly what would be kept and removed, so the cut can be
-        # eyeballed before committing to the (slow) re-encode.
-        print("Kept time-ranges (start -> end, duration):")
-        for i, (s, e) in enumerate(keep, 1):
-            print(f"  {i:3d}. {format_duration(s)} -> {format_duration(e)}  "
-                  f"({format_duration(e - s)})")
-        removed_ranges = complement(keep, original)
-        print("\nRemoved time-ranges (start -> end, duration):")
-        if removed_ranges:
-            for i, (s, e) in enumerate(removed_ranges, 1):
-                print(f"  {i:3d}. {format_duration(s)} -> {format_duration(e)}  "
-                      f"({format_duration(e - s)})")
-        else:
-            print("  (nothing removed)")
-        print()
-
-    if not args.dry_run:
-        print("Cutting and re-encoding... (this can take a while)")
-        cut_and_concat(args.input, output, keep,
-                       args.video_codec, args.audio_codec, args.crf)
-        shortened = get_duration(output)  # report the real result
-        removed = original - shortened
-        percent = (removed / original * 100) if original else 0.0
-
-    # ----- summary -------------------------------------------------------- #
-    print("\n" + "=" * 44)
-    print(f"  Original length:  {format_duration(original)}")
-    print(f"  Shortened length: {format_duration(shortened)}")
-    print(f"  Removed:          {format_duration(removed)} ({percent:.1f}%)")
-    print("=" * 44)
-    if not args.dry_run:
-        print(f"  Saved to: {output}")
+    if folder_mode:
+        ok = sum(1 for r in results if r["status"] == "ok")
+        print(f"\nDone. {ok}/{len(results)} file(s) processed successfully.")
+    if args.log:
+        print(f"Log written to: {os.path.abspath(args.log)}")
 
 
 if __name__ == "__main__":
