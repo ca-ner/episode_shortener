@@ -439,6 +439,15 @@ def main(argv=None):
     print(f"Detected {len(speech)} speech region(s); "
           f"keeping {len(keep)} segment(s) after padding/merging.\n")
 
+    if args.dry_run:
+        # Show exactly what would be kept, so the cut can be eyeballed before
+        # committing to the (slow) re-encode.
+        print("Kept time-ranges (start -> end, duration):")
+        for i, (s, e) in enumerate(keep, 1):
+            print(f"  {i:3d}. {format_duration(s)} -> {format_duration(e)}  "
+                  f"({format_duration(e - s)})")
+        print()
+
     if not args.dry_run:
         print("Cutting and re-encoding... (this can take a while)")
         cut_and_concat(args.input, output, keep,
