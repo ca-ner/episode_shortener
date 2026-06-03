@@ -291,6 +291,19 @@ def total_length(segments):
     return sum(e - s for s, e in segments)
 
 
+def complement(segments, duration):
+    """Return the gaps between (sorted) kept segments over [0, duration]."""
+    gaps = []
+    cursor = 0.0
+    for s, e in segments:
+        if s > cursor:
+            gaps.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < duration:
+        gaps.append((cursor, duration))
+    return gaps
+
+
 # --------------------------------------------------------------------------- #
 # Cutting
 # --------------------------------------------------------------------------- #
@@ -440,12 +453,20 @@ def main(argv=None):
           f"keeping {len(keep)} segment(s) after padding/merging.\n")
 
     if args.dry_run:
-        # Show exactly what would be kept, so the cut can be eyeballed before
-        # committing to the (slow) re-encode.
+        # Show exactly what would be kept and removed, so the cut can be
+        # eyeballed before committing to the (slow) re-encode.
         print("Kept time-ranges (start -> end, duration):")
         for i, (s, e) in enumerate(keep, 1):
             print(f"  {i:3d}. {format_duration(s)} -> {format_duration(e)}  "
                   f"({format_duration(e - s)})")
+        removed_ranges = complement(keep, original)
+        print("\nRemoved time-ranges (start -> end, duration):")
+        if removed_ranges:
+            for i, (s, e) in enumerate(removed_ranges, 1):
+                print(f"  {i:3d}. {format_duration(s)} -> {format_duration(e)}  "
+                      f"({format_duration(e - s)})")
+        else:
+            print("  (nothing removed)")
         print()
 
     if not args.dry_run:
