@@ -1,0 +1,3 @@
+# Required only for the default "vad" (voice activity) detector.
+# The "silence" detector needs no Python packages, just ffmpeg.
+webrtcvad-wheels>=2.0.10
