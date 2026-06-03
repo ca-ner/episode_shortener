@@ -15,7 +15,8 @@ Usage:
 The input may also be a *folder*, in which case every video inside it is
 processed into a ``<name>_processed.mp4`` sibling (folder mode). Pass
 ``-log <file>`` to append a detailed report (filenames, codecs, lengths, kept
-and removed time-ranges) for every processed file.
+and removed time-ranges) for every processed file, and ``--ignore-errors`` to
+push through corrupted/damaged streams instead of aborting.
 
 Requires ``ffmpeg``/``ffprobe`` on PATH. The default ``silero`` detector also
 needs the ``onnxruntime`` and ``numpy`` Python packages plus the bundled
@@ -48,6 +49,18 @@ SILERO_MODEL_URL = ("https://github.com/snakers4/silero-vad/raw/master/"
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
+def tolerant_input_flags(ignore_errors):
+    """ffmpeg input flags that make it tolerate corrupted/damaged streams.
+
+    Placed before ``-i``: ``-err_detect ignore_err`` keeps decoding past
+    errors, ``+discardcorrupt`` drops corrupt packets, and ``+genpts``
+    regenerates timestamps so the cut still lines up afterwards.
+    """
+    if not ignore_errors:
+        return []
+    return ["-err_detect", "ignore_err", "-fflags", "+discardcorrupt+genpts"]
+
+
 def require_tool(name):
     """Exit with a friendly message if an external tool is missing."""
     if shutil.which(name) is None:
@@ -68,11 +81,12 @@ def format_duration(seconds):
     return f"{minutes}:{secs:05.2f}"
 
 
-def get_duration(path):
+def get_duration(path, ignore_errors=False):
     """Return the duration of a media file in seconds via ffprobe."""
     result = subprocess.run(
         [
             "ffprobe", "-v", "error",
+            *tolerant_input_flags(ignore_errors),
             "-show_entries", "format=duration",
             "-of", "json", path,
         ],
@@ -105,7 +119,8 @@ def _ensure_silero_model(model_path):
     return model_path
 
 
-def detect_speech_silero(path, threshold, min_silence, min_speech, model_path):
+def detect_speech_silero(path, threshold, min_silence, min_speech, model_path,
+                         ignore_errors=False):
     """Detect speech with the Silero VAD neural model (the default).
 
     Silero is trained specifically to find *human voice*, so it reliably
@@ -129,13 +144,15 @@ def detect_speech_silero(path, threshold, min_silence, min_speech, model_path):
 
     proc = subprocess.run(
         [
-            "ffmpeg", "-v", "error", "-i", path,
+            "ffmpeg", "-v", "error",
+            *tolerant_input_flags(ignore_errors),
+            "-i", path,
             "-vn", "-ac", "1", "-ar", str(sample_rate),
             "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1",
         ],
         capture_output=True,
     )
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not ignore_errors:
         sys.exit(f"error: ffmpeg failed to extract audio:\n{proc.stderr.decode(errors='replace').strip()}")
 
     audio = np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
@@ -161,7 +178,8 @@ def detect_speech_silero(path, threshold, min_silence, min_speech, model_path):
     return _frames_to_segments(flags, frame_dur, min_silence, min_speech)
 
 
-def detect_speech_vad(path, aggressiveness, frame_ms, min_silence, min_speech):
+def detect_speech_vad(path, aggressiveness, frame_ms, min_silence, min_speech,
+                      ignore_errors=False):
     """Detect speech with WebRTC voice-activity detection.
 
     A lightweight alternative to the Silero detector. Better than plain volume
@@ -186,13 +204,15 @@ def detect_speech_vad(path, aggressiveness, frame_ms, min_silence, min_speech):
     # Decode the whole soundtrack to raw 16 kHz mono PCM and stream it in.
     proc = subprocess.run(
         [
-            "ffmpeg", "-v", "error", "-i", path,
+            "ffmpeg", "-v", "error",
+            *tolerant_input_flags(ignore_errors),
+            "-i", path,
             "-vn", "-ac", "1", "-ar", str(sample_rate),
             "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1",
         ],
         capture_output=True,
     )
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not ignore_errors:
         sys.exit(f"error: ffmpeg failed to extract audio:\n{proc.stderr.decode(errors='replace').strip()}")
 
     pcm = proc.stdout
@@ -239,7 +259,8 @@ def _frames_to_segments(flags, frame_dur, min_silence, min_speech):
     return [(s, e) for s, e in bridged if (e - s) >= min_speech]
 
 
-def detect_speech_silence(path, noise_db, min_silence, duration):
+def detect_speech_silence(path, noise_db, min_silence, duration,
+                          ignore_errors=False):
     """Detect speech as 'whatever isn't silence', using ffmpeg's silencedetect.
 
     Fast and dependency-free, but treats any audio above the threshold
@@ -247,7 +268,9 @@ def detect_speech_silence(path, noise_db, min_silence, duration):
     """
     proc = subprocess.run(
         [
-            "ffmpeg", "-v", "info", "-i", path, "-vn",
+            "ffmpeg", "-v", "info",
+            *tolerant_input_flags(ignore_errors),
+            "-i", path, "-vn",
             "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
             "-f", "null", "-",
         ],
@@ -319,7 +342,8 @@ def complement(segments, duration):
 # --------------------------------------------------------------------------- #
 # Cutting
 # --------------------------------------------------------------------------- #
-def cut_and_concat(input_path, output_path, segments, video_codec, audio_codec, crf):
+def cut_and_concat(input_path, output_path, segments, video_codec, audio_codec,
+                   crf, ignore_errors=False):
     """Keep only ``segments`` and concatenate them into a single output file.
 
     Uses an ffmpeg filtergraph (trim + concat) so cuts are frame-accurate
@@ -340,7 +364,9 @@ def cut_and_concat(input_path, output_path, segments, video_codec, audio_codec, 
 
     try:
         cmd = [
-            "ffmpeg", "-v", "error", "-stats", "-y", "-i", input_path,
+            "ffmpeg", "-v", "error", "-stats", "-y",
+            *tolerant_input_flags(ignore_errors),
+            "-i", input_path,
             "-filter_complex_script", script_path,
             "-map", "[outv]", "-map", "[outa]",
             "-c:v", video_codec, "-crf", str(crf),
@@ -349,7 +375,15 @@ def cut_and_concat(input_path, output_path, segments, video_codec, audio_codec, 
         ]
         proc = subprocess.run(cmd)
         if proc.returncode != 0:
-            sys.exit("error: ffmpeg failed while cutting the video.")
+            # With --ignore-errors, tolerate a non-zero exit as long as ffmpeg
+            # still produced a non-empty output file (corrupt packets dropped).
+            produced = (os.path.isfile(output_path)
+                        and os.path.getsize(output_path) > 0)
+            if ignore_errors and produced:
+                print("  warning: ffmpeg reported errors but produced output "
+                      "(--ignore-errors); continuing.")
+            else:
+                sys.exit("error: ffmpeg failed while cutting the video.")
     finally:
         os.unlink(script_path)
 
@@ -419,6 +453,12 @@ def parse_args(argv=None):
 
     p.add_argument("--dry-run", action="store_true",
                    help="only detect and report; do not write an output file")
+    p.add_argument("--ignore-errors", "-ignore-errors", dest="ignore_errors",
+                   action="store_true",
+                   help="tell ffmpeg to tolerate corrupted/damaged streams "
+                        "(discard corrupt packets and keep going) instead of "
+                        "aborting; also accepts a non-zero ffmpeg exit if an "
+                        "output file was still produced")
     p.add_argument("-log", "--log", dest="log",
                    help="append a detailed report for every processed file to "
                         "this log file (filenames, codecs, lengths, kept and "
@@ -431,15 +471,16 @@ def run_detector(args, input_path, original):
     if args.detector == "silero":
         return detect_speech_silero(
             input_path, args.threshold, args.min_silence,
-            args.min_speech, args.model,
+            args.min_speech, args.model, args.ignore_errors,
         )
     if args.detector == "vad":
         return detect_speech_vad(
             input_path, args.aggressiveness, args.frame_ms,
-            args.min_silence, args.min_speech,
+            args.min_silence, args.min_speech, args.ignore_errors,
         )
     return detect_speech_silence(
         input_path, args.noise_db, args.min_silence, original,
+        args.ignore_errors,
     )
 
 
@@ -459,7 +500,7 @@ def process_one(args, input_path, output_path):
     Never raises on "no speech" — it returns a result with status set so batch
     (folder) runs can keep going.
     """
-    original = get_duration(input_path)
+    original = get_duration(input_path, args.ignore_errors)
     result = {
         "input": input_path,
         "output": output_path,
@@ -469,6 +510,7 @@ def process_one(args, input_path, output_path):
         "crf": args.crf,
         "original": original,
         "dry_run": args.dry_run,
+        "ignore_errors": args.ignore_errors,
         "status": "ok",
         "keep": [],
         "removed": [],
@@ -502,8 +544,9 @@ def process_one(args, input_path, output_path):
     if not args.dry_run:
         print("Cutting and re-encoding... (this can take a while)")
         cut_and_concat(input_path, output_path, keep,
-                       args.video_codec, args.audio_codec, args.crf)
-        shortened = get_duration(output_path)  # report the real result
+                       args.video_codec, args.audio_codec, args.crf,
+                       args.ignore_errors)
+        shortened = get_duration(output_path, args.ignore_errors)  # real result
         result["shortened"] = shortened
 
     removed = original - shortened
@@ -539,6 +582,7 @@ def write_log_entry(log_path, result):
     else:
         lines.append(f"  Output file:      {os.path.abspath(result['output'])}")
     lines.append(f"  Detector:         {result['detector']}")
+    lines.append(f"  Ignore errors:    {result.get('ignore_errors', False)}")
     lines.append(f"  Video codec:      {result['video_codec']} (crf {result['crf']})")
     lines.append(f"  Audio codec:      {result['audio_codec']}")
     lines.append(f"  Original length:  {format_duration(original)}")
@@ -626,6 +670,7 @@ def main(argv=None):
                 "detector": args.detector, "video_codec": args.video_codec,
                 "audio_codec": args.audio_codec, "crf": args.crf,
                 "original": 0.0, "shortened": 0.0, "dry_run": args.dry_run,
+                "ignore_errors": args.ignore_errors,
                 "status": "error", "keep": [], "removed": [],
             }
         results.append(result)

@@ -51,6 +51,9 @@ python3 episode_shortener.py episode.mkv --threshold 0.6
 # Just see how much would be removed, without encoding anything
 python3 episode_shortener.py episode.mkv --dry-run
 
+# Tolerate corrupted/damaged streams instead of aborting
+python3 episode_shortener.py episode.mkv --ignore-errors
+
 # Folder mode: process EVERY video in a folder, writing <name>_processed.mp4
 python3 episode_shortener.py /path/to/season -x 1 -y 1
 
@@ -104,6 +107,17 @@ shortened / removed lengths, and the full kept and removed time-ranges:
 The log is appended to (never overwritten), so a folder run produces one entry
 per file in a single file.
 
+## Corrupted streams (`--ignore-errors`)
+
+Damaged rips sometimes have corrupt packets that make ffmpeg bail out. Pass
+`--ignore-errors` to push through them: it adds ffmpeg's
+`-err_detect ignore_err -fflags +discardcorrupt+genpts` to every read of the
+input (so corrupt packets are dropped and timestamps regenerated), and it
+accepts a non-zero ffmpeg exit code as long as an output file was still
+produced. Handy in folder mode where one bad file shouldn't stop the batch.
+The output may have small glitches around the damaged spots, but you get a
+usable file instead of a hard failure.
+
 ### Key options
 
 | Option | Default | Meaning |
@@ -115,6 +129,7 @@ per file in a single file.
 | `--min-silence` | `0.5` | Gaps shorter than this aren't treated as filler |
 | `--min-speech` | `0.2` | Ignore detected speech shorter than this |
 | `--dry-run` | off | Detect & report only; don't write a file |
+| `--ignore-errors` | off | Tolerate corrupted streams (see below) |
 | `-log`, `--log` | off | Append a detailed per-file report to this log file |
 | `--crf` | `20` | Output quality for x264 (lower = better/larger) |
 
