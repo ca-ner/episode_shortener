@@ -18,9 +18,20 @@ processed into a ``<name>_processed.mp4`` sibling (folder mode). Pass
 and removed time-ranges) for every processed file, and ``--ignore-errors`` to
 push through corrupted/damaged streams instead of aborting.
 
-Requires ``ffmpeg``/``ffprobe`` on PATH. The default ``silero`` detector also
-needs the ``onnxruntime`` and ``numpy`` Python packages plus the bundled
-``silero_vad.onnx`` model file.
+By default the script runs two complementary detection passes and merges their
+results:
+
+1. **Whisper ASR** — transcribes the audio with OpenAI Whisper and extracts
+   per-sentence timestamps. Catches dialogue the VAD model might miss (quiet
+   speech, speech over music). Requires ``openai-whisper`` + PyTorch.
+2. **VAD detector** (default: ``silero``) — a neural voice-activity model that
+   rejects music/noise and finds speech frames at high resolution. Requires
+   ``onnxruntime`` + ``numpy`` plus the bundled ``silero_vad.onnx`` model.
+
+Pass ``--no-whisper`` to skip step 1 for faster runs.  Use ``--whisper-log``
+to dump the full Whisper transcript with timestamps to a separate file.
+
+Requires ``ffmpeg``/``ffprobe`` on PATH.
 """
 
 import argparse
@@ -319,23 +330,22 @@ def detect_speech_silence(path, noise_db, min_silence, duration,
 def detect_speech_whisper(path, model_name, language, min_speech, ignore_errors=False):
     """Detect speech using OpenAI Whisper ASR with Turkish and multilingual support.
 
-    Transcribes the audio with a neural speech-recognition model and extracts
-    per-sentence timestamps. Complements VAD detectors by catching dialogue that
-    pure voice-activity detection misses (e.g. quiet speech, speech over music).
-    Returns a list of (start, end) speech intervals in seconds.
+    Transcribes the audio and extracts per-sentence timestamps. Returns a list
+    of dicts — each with ``start``, ``end`` (seconds), and ``text`` — so callers
+    can both use the intervals and write a readable transcript log.
     """
     try:
         import whisper as _whisper
     except ImportError:
         sys.exit(
-            "error: --whisper-check requires the openai-whisper package.\n"
+            "error: Whisper ASR requires the openai-whisper package.\n"
             "       Install it with:  pip install openai-whisper\n"
             "       (also needs PyTorch: https://pytorch.org/get-started/locally/)\n"
-            "       or omit --whisper-check to use the primary detector only."
+            "       or pass --no-whisper to skip the Whisper step."
         )
 
     lang_label = language if language else "auto"
-    print(f"  Loading Whisper '{model_name}' model and transcribing "
+    print(f"  [Whisper] Loading '{model_name}' model and transcribing "
           f"(language='{lang_label}') — this may take a while...")
     model = _whisper.load_model(model_name)
     result = model.transcribe(
@@ -345,15 +355,39 @@ def detect_speech_whisper(path, model_name, language, min_speech, ignore_errors=
         verbose=False,
     )
 
-    segments = []
+    timed_segments = []
     for seg in result.get("segments", []):
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", 0.0))
-        if end - start >= min_speech and seg.get("text", "").strip():
-            segments.append((start, end))
+        text = seg.get("text", "").strip()
+        if end - start >= min_speech and text:
+            timed_segments.append({"start": start, "end": end, "text": text})
 
-    print(f"  Whisper transcription done: {len(segments)} speech segment(s) found.")
-    return segments
+    print(f"  [Whisper] Done: {len(timed_segments)} speech segment(s) found.")
+    return timed_segments
+
+
+def write_whisper_log(log_path, input_path, timed_segments, model_name, language):
+    """Append the full Whisper transcript with per-sentence timestamps to a file."""
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lang_label = language if language else "auto"
+    lines = [
+        "=" * 70,
+        f"[{stamp}] Whisper transcript: {os.path.basename(input_path)}",
+        f"  Source file:  {os.path.abspath(input_path)}",
+        f"  Model:        {model_name}   language: {lang_label}",
+        f"  Segments:     {len(timed_segments)}",
+        "",
+    ]
+    for i, seg in enumerate(timed_segments, 1):
+        s, e, text = seg["start"], seg["end"], seg["text"]
+        lines.append(
+            f"  {i:4d}. {format_duration(s)} -> {format_duration(e)}  "
+            f"({format_duration(e - s)})  {text}"
+        )
+    lines.append("")
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -499,12 +533,12 @@ def parse_args(argv=None):
     p.add_argument("--min-silence", type=float, default=0.5,
                    help="gaps shorter than this (s) are not treated as filler")
 
-    # Whisper ASR cross-check (optional, boosts recall for missed dialogue).
-    p.add_argument("--whisper-check", action="store_true",
-                   help="run OpenAI Whisper ASR alongside the primary detector "
-                        "and keep any speech segment found by either — boosts "
-                        "recall for dialogue that the VAD model missed. "
-                        "Requires: pip install openai-whisper (+ PyTorch)")
+    # Whisper ASR (runs first by default; both passes are merged for accuracy).
+    p.add_argument("--no-whisper", action="store_true",
+                   help="skip the Whisper ASR step and rely on the VAD detector "
+                        "alone (faster but may miss dialogue the VAD misses). "
+                        "Use when openai-whisper is not installed or speed "
+                        "matters more than recall.")
     p.add_argument("--whisper-model", default="small", metavar="MODEL",
                    help="[whisper] model size: tiny, base, small, medium, large, "
                         "large-v2, large-v3, turbo. Larger = more accurate but "
@@ -513,6 +547,10 @@ def parse_args(argv=None):
                    help="[whisper] BCP-47 language code for transcription "
                         "(e.g. 'tr' for Turkish, 'en' for English). "
                         "Pass '' to let Whisper auto-detect the language.")
+    p.add_argument("--whisper-log", default=None, metavar="FILE",
+                   help="[whisper] append the full Whisper transcript with "
+                        "per-sentence timestamps to this file — handy for "
+                        "reviewing exactly what speech was detected")
 
     # Encoding.
     p.add_argument("--video-codec", default="libx264", help="output video codec")
@@ -536,39 +574,54 @@ def parse_args(argv=None):
 
 
 def run_detector(args, input_path, original):
-    """Dispatch to the configured detector and return speech intervals.
+    """Run Whisper ASR then the VAD detector, and return the union of both.
 
-    When ``--whisper-check`` is set, Whisper is also run and its timestamps are
-    unioned with the primary detector's results so any dialogue missed by the
-    first pass is still captured.
+    Step 1 — Whisper (default, skip with ``--no-whisper``): transcribes the
+    audio and extracts sentence-level timestamps.  Writes a transcript log if
+    ``--whisper-log`` is given.
+
+    Step 2 — VAD detector (``--detector silero|vad|silence``): finds speech
+    frames at high resolution, reliably rejecting music and noise.
+
+    The two segment lists are unioned so nothing found by either pass is lost.
     """
+    # Step 1: Whisper ASR.
+    whisper_segs = []
+    if not args.no_whisper:
+        whisper_data = detect_speech_whisper(
+            input_path, args.whisper_model, args.whisper_language,
+            args.min_speech, args.ignore_errors,
+        )
+        if args.whisper_log:
+            write_whisper_log(
+                args.whisper_log, input_path, whisper_data,
+                args.whisper_model, args.whisper_language,
+            )
+        whisper_segs = [(d["start"], d["end"]) for d in whisper_data]
+
+    # Step 2: VAD detector.
     if args.detector == "silero":
-        speech = detect_speech_silero(
+        vad_segs = detect_speech_silero(
             input_path, args.threshold, args.min_silence,
             args.min_speech, args.model, args.ignore_errors,
         )
     elif args.detector == "vad":
-        speech = detect_speech_vad(
+        vad_segs = detect_speech_vad(
             input_path, args.aggressiveness, args.frame_ms,
             args.min_silence, args.min_speech, args.ignore_errors,
         )
     else:
-        speech = detect_speech_silence(
+        vad_segs = detect_speech_silence(
             input_path, args.noise_db, args.min_silence, original,
             args.ignore_errors,
         )
 
-    if args.whisper_check:
-        whisper_segs = detect_speech_whisper(
-            input_path, args.whisper_model, args.whisper_language,
-            args.min_speech, args.ignore_errors,
-        )
-        speech_before = len(speech)
-        speech = union_segments(speech, whisper_segs)
-        extra = len(speech) - speech_before
-        print(f"  Cross-check: '{args.detector}' found {speech_before} segment(s), "
-              f"Whisper found {len(whisper_segs)} segment(s); "
-              f"merged total: {len(speech)} (+{extra} new from Whisper).")
+    # Step 3: Merge.
+    speech = union_segments(whisper_segs, vad_segs)
+    if not args.no_whisper:
+        print(f"  [Merge] Whisper: {len(whisper_segs)}, "
+              f"'{args.detector}': {len(vad_segs)}, "
+              f"merged: {len(speech)} segment(s).")
 
     return speech
 
@@ -594,7 +647,7 @@ def process_one(args, input_path, output_path):
         "input": input_path,
         "output": output_path,
         "detector": args.detector,
-        "whisper_check": args.whisper_check,
+        "no_whisper": args.no_whisper,
         "whisper_model": args.whisper_model,
         "whisper_language": args.whisper_language,
         "video_codec": args.video_codec,
@@ -609,7 +662,9 @@ def process_one(args, input_path, output_path):
         "shortened": 0.0,
     }
 
-    print(f"\nAnalyzing '{input_path}' with the '{args.detector}' detector...")
+    whisper_label = "Whisper + " if not args.no_whisper else ""
+    print(f"\nAnalyzing '{input_path}' "
+          f"({whisper_label}'{args.detector}' detector)...")
     speech = run_detector(args, input_path, original)
 
     if not speech:
@@ -674,8 +729,8 @@ def write_log_entry(log_path, result):
     else:
         lines.append(f"  Output file:      {os.path.abspath(result['output'])}")
     lines.append(f"  Detector:         {result['detector']}")
-    if result.get("whisper_check"):
-        lines.append(f"  Whisper check:    {result.get('whisper_model', 'small')} "
+    if not result.get("no_whisper"):
+        lines.append(f"  Whisper ASR:      {result.get('whisper_model', 'small')} "
                      f"(language: {result.get('whisper_language', 'tr') or 'auto'})")
     lines.append(f"  Ignore errors:    {result.get('ignore_errors', False)}")
     lines.append(f"  Video codec:      {result['video_codec']} (crf {result['crf']})")
@@ -763,7 +818,7 @@ def main(argv=None):
             result = {
                 "input": input_path, "output": output_path,
                 "detector": args.detector,
-                "whisper_check": args.whisper_check,
+                "no_whisper": args.no_whisper,
                 "whisper_model": args.whisper_model,
                 "whisper_language": args.whisper_language,
                 "video_codec": args.video_codec,
@@ -781,6 +836,8 @@ def main(argv=None):
         print(f"\nDone. {ok}/{len(results)} file(s) processed successfully.")
     if args.log:
         print(f"Log written to: {os.path.abspath(args.log)}")
+    if args.whisper_log:
+        print(f"Whisper transcript log written to: {os.path.abspath(args.whisper_log)}")
 
 
 if __name__ == "__main__":
