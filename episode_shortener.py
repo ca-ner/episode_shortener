@@ -333,8 +333,13 @@ def detect_speech_whisper(path, model_name, language, min_speech, ignore_errors=
     Transcribes the audio and extracts per-sentence timestamps. Returns a list
     of dicts — each with ``start``, ``end`` (seconds), and ``text`` — so callers
     can both use the intervals and write a readable transcript log.
+
+    Audio is extracted through our own ffmpeg pipeline (not Whisper's internal
+    one) so that ``ignore_errors`` / corrupt-stream tolerance is applied before
+    Whisper ever sees the data.
     """
     try:
+        import numpy as np
         import whisper as _whisper
     except ImportError:
         sys.exit(
@@ -344,12 +349,35 @@ def detect_speech_whisper(path, model_name, language, min_speech, ignore_errors=
             "       or pass --no-whisper to skip the Whisper step."
         )
 
+    # Extract audio ourselves so tolerant_input_flags are applied and corrupt
+    # packets (e.g. bad AAC frames) don't abort before Whisper sees any audio.
+    sample_rate = 16000
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-v", "error",
+            *tolerant_input_flags(ignore_errors),
+            "-i", path,
+            "-vn", "-ac", "1", "-ar", str(sample_rate),
+            "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1",
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0 and not ignore_errors:
+        sys.exit(
+            f"error: ffmpeg failed to extract audio for Whisper:\n"
+            f"{proc.stderr.decode(errors='replace').strip()}\n"
+            f"       Try adding --ignore-errors to tolerate corrupt packets."
+        )
+
+    # int16 PCM → float32, the same format whisper.load_audio() produces.
+    audio = np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
     lang_label = language if language else "auto"
     print(f"  [Whisper] Loading '{model_name}' model and transcribing "
           f"(language='{lang_label}') — this may take a while...")
     model = _whisper.load_model(model_name)
     result = model.transcribe(
-        path,
+        audio,
         language=language if language else None,
         task="transcribe",
         verbose=False,
