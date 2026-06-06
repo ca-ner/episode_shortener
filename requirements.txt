@@ -5,3 +5,8 @@ numpy>=1.21
 # Optional: only needed for the lighter "--detector vad" (WebRTC) backend.
 # The "silence" detector needs no Python packages, just ffmpeg.
 webrtcvad-wheels>=2.0.10
+
+# Optional: only needed for "--whisper-check" (Whisper ASR cross-check).
+# Also requires PyTorch — see https://pytorch.org/get-started/locally/ for the
+# right install command for your platform (CPU-only is fine for transcription).
+openai-whisper>=20231117
